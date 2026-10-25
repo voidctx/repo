@@ -1,7 +1,7 @@
-{
-  "schema_version": 1,
-  "repository": "voidctx",
-  "architecture": "x86_64",
-  "updated_at": null,
-  "packages": []
-}
+[
+  {
+    "name": "arkcode",
+    "asset": "arkcode-linux-x86_64",
+    "url": "https://github.com/voidctx/arkcode"
+  }
+]

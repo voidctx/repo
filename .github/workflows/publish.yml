@@ -1,0 +1,245 @@
+name: Publish package
+
+on:
+  repository_dispatch:
+    types: [publish-pacman-package]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voidctx-package-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate release and catalog entry
+        id: meta
+        env:
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          TAG: ${{ github.event.client_payload.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.0$ ]]
+
+          matches="$(jq -c \
+            --arg repo "$SOURCE_REPO" \
+            '[.[] | select(
+              (.url | sub("^https://github.com/"; "") | sub("/$"; ""))
+              == $repo
+            )]' metadata/packages.json)"
+
+          [[ "$(jq 'length' <<< "$matches")" == 1 ]] || {
+            echo "No unique package mapping for $SOURCE_REPO" >&2
+            exit 1
+          }
+
+          entry="$(jq -c '.[0]' <<< "$matches")"
+          name="$(jq -r '.name' <<< "$entry")"
+          asset="$(jq -r '.asset' <<< "$entry")"
+          url="$(jq -r '.url' <<< "$entry")"
+
+          [[ "$name" =~ ^[a-z0-9][a-z0-9@._+-]*$ ]]
+          [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ ]]
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify release binary
+        id: binary
+        env:
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          TAG: ${{ github.event.client_payload.tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dir="$RUNNER_TEMP/release"
+          mkdir -p "$dir"
+
+          base="https://github.com/${SOURCE_REPO}/releases/download/${TAG}"
+
+          curl --fail --location --retry 3 \
+            "$base/SHA256SUMS" -o "$dir/SHA256SUMS"
+
+          curl --fail --location --retry 3 \
+            "$base/$ASSET" -o "$dir/$ASSET"
+
+          expected="$(awk -v f="$ASSET" '$2 == f {print $1}' \
+            "$dir/SHA256SUMS")"
+
+          [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || {
+            echo "Missing or invalid SHA256SUMS entry" >&2
+            exit 1
+          }
+
+          printf '%s  %s\n' "$expected" "$ASSET" \
+            | (cd "$dir" && sha256sum --check -)
+
+          echo "binary_sha256=$expected" >> "$GITHUB_OUTPUT"
+
+      - name: Build Arch package from static binary
+        id: package
+        env:
+          PKGNAME: ${{ steps.meta.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          URL: ${{ steps.meta.outputs.url }}
+          BINARY_SHA256: ${{ steps.binary.outputs.binary_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          work="$RUNNER_TEMP/pkgwork"
+          out="$RUNNER_TEMP/pkgout"
+
+          mkdir -p "$work" "$out"
+          cp "$RUNNER_TEMP/release/$ASSET" "$work/$ASSET"
+
+          cat > "$work/PKGBUILD" <<PKGBUILD
+          pkgname=$PKGNAME
+          pkgver=$VERSION
+          pkgrel=1
+          pkgdesc="$PKGNAME static-musl binary"
+          arch=('x86_64')
+          url='$URL'
+          depends=()
+          options=('!strip')
+          source=("file:///work/$ASSET")
+          sha256sums=('$BINARY_SHA256')
+
+          package() {
+            install -Dm755 "\$srcdir/$ASSET" \
+              "\$pkgdir/usr/bin/$PKGNAME"
+          }
+          PKGBUILD
+
+          docker run --rm \
+            -v "$work:/work" \
+            -w /work \
+            archlinux:latest \
+            bash -euc '
+              pacman -Syu --noconfirm
+              pacman -S --needed --noconfirm base-devel
+              useradd -m builder
+              chown -R builder:builder /work
+              runuser -u builder -- \
+                makepkg --syncdeps --noconfirm --cleanbuild
+            '
+
+          mapfile -t built < <(
+            find "$work" -maxdepth 1 -type f \
+              -name "${PKGNAME}-*.pkg.tar.zst"
+          )
+
+          ((${#built[@]} == 1)) || {
+            echo "Expected exactly one built package" >&2
+            exit 1
+          }
+
+          # R2 uses a stable filename; the package's internal
+          # metadata still contains the real version.
+          mv "${built[0]}" "$out/$PKGNAME.pkg.tar.zst"
+
+          sha="$(sha256sum "$out/$PKGNAME.pkg.tar.zst" | awk '{print $1}')"
+          echo "package_sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Sign package
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ vars.PACMAN_GPG_KEY_ID }}
+          PKGNAME: ${{ steps.meta.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "$GPG_PRIVATE_KEY" ]]
+          [[ -n "$GPG_PASSPHRASE" ]]
+          [[ -n "$GPG_KEY_ID" ]]
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --local-user "$GPG_KEY_ID" \
+            --detach-sign \
+            --output "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst.sig" \
+            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst"
+
+      - name: Upload temporary package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pacman-package
+          path: ${{ runner.temp }}/pkgout/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload current package to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PKGNAME: ${{ steps.meta.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          for file in \
+            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst" \
+            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst.sig"; do
+
+            docker run --rm \
+              -v "$RUNNER_TEMP/pkgout:/out:ro" \
+              -e AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+              -e AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+              -e AWS_DEFAULT_REGION=auto \
+              amazon/aws-cli:2 \
+              s3 cp "/out/$(basename "$file")" \
+              "s3://${R2_BUCKET}/x86_64/$(basename "$file")" \
+              --endpoint-url "$endpoint" \
+              --only-show-errors
+          done
+
+      - name: Trigger database update workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKGNAME: ${{ steps.meta.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          URL: ${{ steps.meta.outputs.url }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          PACKAGE_SHA256: ${{ steps.package.outputs.package_sha256 }}
+          TAG: ${{ github.event.client_payload.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api --method POST \
+            repos/voidctx/repo/dispatches \
+            -f event_type='update-pacman-db' \
+            -f client_payload[name]="$PKGNAME" \
+            -f client_payload[version]="$VERSION" \
+            -f client_payload[url]="$URL" \
+            -f client_payload[asset]="$ASSET" \
+            -f client_payload[tag]="$TAG" \
+            -f client_payload[sha256]="$PACKAGE_SHA256" \
+            -F client_payload[run_id]="$GITHUB_RUN_ID"

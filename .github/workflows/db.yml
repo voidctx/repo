@@ -1,0 +1,183 @@
+name: Update repository database and index
+
+on:
+  repository_dispatch:
+    types: [update-pacman-db]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: voidctx-database-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Validate update payload
+        id: meta
+        env:
+          PKGNAME: ${{ github.event.client_payload.name }}
+          VERSION: ${{ github.event.client_payload.version }}
+          TAG: ${{ github.event.client_payload.tag }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+          PACKAGE_SHA256: ${{ github.event.client_payload.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$PKGNAME" =~ ^[a-z0-9][a-z0-9@._+-]*$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.0$ ]]
+          [[ "$VERSION" == "${TAG#v}" ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$PACKAGE_SHA256" =~ ^[a-fA-F0-9]{64}$ ]]
+
+          echo "filename=$PKGNAME.pkg.tar.zst" >> "$GITHUB_OUTPUT"
+
+      - name: Download package artifact from publisher workflow
+        uses: actions/download-artifact@v4
+        with:
+          name: pacman-package
+          path: incoming
+          run-id: ${{ github.event.client_payload.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify package artifact
+        env:
+          PKGNAME: ${{ github.event.client_payload.name }}
+          PACKAGE_SHA256: ${{ github.event.client_payload.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="incoming/$PKGNAME.pkg.tar.zst"
+
+          test -f "$package"
+          test -f "$package.sig"
+
+          actual="$(sha256sum "$package" | awk '{print $1}')"
+          [[ "$actual" == "$PACKAGE_SHA256" ]] || {
+            echo "Package checksum mismatch" >&2
+            exit 1
+          }
+
+      - name: Update repository database
+        env:
+          PKGNAME: ${{ github.event.client_payload.name }}
+          VERSION: ${{ github.event.client_payload.version }}
+          URL: ${{ github.event.client_payload.url }}
+          ASSET: ${{ github.event.client_payload.asset }}
+          PACKAGE_SHA256: ${{ github.event.client_payload.sha256 }}
+          GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ vars.PACMAN_GPG_KEY_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p x86_64 metadata
+
+          package="$PKGNAME.pkg.tar.zst"
+          cp "incoming/$package" "x86_64/$package"
+
+          # repo-add reads the new package locally and updates the
+          # existing database without downloading other packages.
+          docker run --rm \
+            -v "$PWD/x86_64:/repo" \
+            -e PACKAGE_FILENAME="$package" \
+            archlinux:latest \
+            bash -euc '
+              pacman -Syu --noconfirm
+              cd /repo
+              repo-add voidctx.db.tar.gz "$PACKAGE_FILENAME"
+            '
+
+          # Publish real files rather than Git symlinks.
+          cp x86_64/voidctx.db.tar.gz x86_64/voidctx.db
+
+          # The temporary package must never enter Git.
+          rm -f "x86_64/$package"
+
+          # Import the signing key and sign the database.
+          [[ -n "$GPG_PRIVATE_KEY" ]]
+          [[ -n "$GPG_PASSPHRASE" ]]
+          [[ -n "$GPG_KEY_ID" ]]
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --local-user "$GPG_KEY_ID" \
+            --detach-sign \
+            --output x86_64/voidctx.db.tar.gz.sig \
+            x86_64/voidctx.db.tar.gz
+
+          # The aliases contain identical bytes, so the same
+          # detached signature is valid for both filenames.
+          cp x86_64/voidctx.db.tar.gz.sig x86_64/voidctx.db.sig
+
+          # Initialize the JSON index if this is the first package.
+          if [[ ! -f metadata/index.json ]]; then
+            cat > metadata/index.json <<'JSON'
+          {
+            "repository": "voidctx",
+            "architecture": "x86_64",
+            "updated_at": null,
+            "packages": []
+          }
+          JSON
+          fi
+
+          updated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          jq \
+            --arg name "$PKGNAME" \
+            --arg version "$VERSION" \
+            --arg url "$URL" \
+            --arg asset "$ASSET" \
+            --arg sha256 "$PACKAGE_SHA256" \
+            --arg updated_at "$updated_at" \
+            '
+            .repository = "voidctx" |
+            .architecture = "x86_64" |
+            .updated_at = $updated_at |
+            .packages = (
+              [.packages[]? | select(.name != $name)] +
+              [{
+                name: $name,
+                version: $version,
+                filename: ($name + ".pkg.tar.zst"),
+                url: $url,
+                asset: $asset,
+                sha256: $sha256
+              }]
+              | sort_by(.name)
+            )
+            ' metadata/index.json > metadata/index.json.tmp
+
+          mv metadata/index.json.tmp metadata/index.json
+
+      - name: Commit database and index
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A x86_64 metadata/index.json
+
+          git commit -m "Update voidctx repository metadata"
+          git push origin HEAD:master
