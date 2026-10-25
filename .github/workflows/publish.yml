@@ -25,7 +25,6 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
       GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
       GPG_KEY_ID: ${{ vars.PACMAN_GPG_KEY_ID }}
 
@@ -33,30 +32,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate request and load description
+      - name: Validate request and load package description
         shell: bash
         run: |
           set -euo pipefail
 
           [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
-            echo "Invalid source repository"
+            echo "::error::Invalid source repository"
             exit 1
           }
 
           [[ "$PKGNAME" =~ ^[a-z0-9][a-z0-9@._+-]*$ ]] || {
-            echo "Invalid package name"
+            echo "::error::Invalid package name"
             exit 1
           }
 
           [[ "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.0)$ ]] || {
-            echo "Only stable vX.Y.0 releases are accepted"
+            echo "::error::Only stable vX.Y.0 releases are accepted"
             exit 1
           }
 
           echo "PKGVER=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
 
           python3 - <<'PY'
-          import json, os, sys
+          import json
+          import os
+          import sys
 
           name = os.environ["PKGNAME"]
 
@@ -64,23 +65,54 @@ jobs:
               catalog = json.load(f)
 
           matches = [p for p in catalog if p.get("name") == name]
+
           if len(matches) != 1:
               sys.exit(f"Expected exactly one meta.json entry for {name}")
 
           desc = matches[0].get("desc", "").strip()
-          if not desc or "\n" in desc or "\r" in desc:
+
+          if not desc or "\n" in desc or "\r" in desc or "\0" in desc:
               sys.exit(f"Invalid or missing description for {name}")
 
-          with open(os.environ["RUNNER_TEMP"] + "/package-desc", "w") as f:
+          with open(
+              os.environ["RUNNER_TEMP"] + "/package-desc", "w",
+              encoding="utf-8"
+          ) as f:
               f.write(desc)
           PY
 
       - name: Install tools
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y curl zstd gnupg awscli python3
 
-      - name: Discover and download release assets
+      - name: Decrypt and import signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+          # privkey.asc.gpg is symmetrically encrypted with gpg -c.
+          gpg --batch --yes \
+            --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --output "$RUNNER_TEMP/privkey.asc" \
+            --decrypt "$GITHUB_WORKSPACE/privkey.asc.gpg"
+
+          # The decrypted export contains the unencrypted private key.
+          gpg --batch --import "$RUNNER_TEMP/privkey.asc"
+
+          # Remove the temporary plaintext export.
+          rm -f "$RUNNER_TEMP/privkey.asc"
+
+          # Ensure the expected signing key was imported.
+          gpg --batch --list-secret-keys "$GPG_KEY_ID"
+
+      - name: Download release assets and verify checksums
         shell: bash
         run: |
           set -euo pipefail
@@ -97,12 +129,17 @@ jobs:
             -o release.json
 
           python3 - <<'PY'
-          import json, os, re, sys
+          import json
+          import os
+          import sys
 
           name = os.environ["PKGNAME"]
 
           with open("release.json", encoding="utf-8") as f:
               release = json.load(f)
+
+          if release.get("draft") or release.get("prerelease"):
+              sys.exit("Refusing to package a draft or prerelease")
 
           assets = release.get("assets", [])
           binaries = []
@@ -111,13 +148,13 @@ jobs:
           for asset in assets:
               filename = asset["name"]
 
-              if (
-                  filename == f"{name}-linux-x86_64"
-                  or (
-                      filename.startswith(name + "-")
-                      and filename.endswith("-linux-x86_64")
-                      and len(filename) > len(name + "-linux-x86_64")
-                  )
+              if filename == f"{name}-linux-x86_64":
+                  binaries.append(asset)
+
+              elif (
+                  filename.startswith(name + "-")
+                  and filename.endswith("-linux-x86_64")
+                  and len(filename) > len(name + "-linux-x86_64")
               ):
                   binaries.append(asset)
 
@@ -130,19 +167,20 @@ jobs:
 
           if len(binaries) != 1:
               sys.exit(
-                  f"Expected exactly one matching Linux x86_64 executable; "
-                  f"found {[a['name'] for a in binaries]}"
+                  "Expected exactly one matching x86_64 executable; found: "
+                  + repr([a["name"] for a in binaries])
               )
 
           selected = binaries + configs
 
           if len({a["name"] for a in selected}) != len(selected):
-              sys.exit("Duplicate release asset names")
+              sys.exit("Duplicate asset names")
 
-          checksum_assets = [
+          checksums = [
               a for a in assets if a["name"] == "SHA256SUMS"
           ]
-          if len(checksum_assets) != 1:
+
+          if len(checksums) != 1:
               sys.exit("Release must contain exactly one SHA256SUMS asset")
 
           with open("assets.tsv", "w", encoding="utf-8") as f:
@@ -153,7 +191,7 @@ jobs:
                   )
 
           with open("checksums-url", "w", encoding="utf-8") as f:
-              f.write(checksum_assets[0]["browser_download_url"])
+              f.write(checksums[0]["browser_download_url"])
           PY
 
           while IFS=$'\t' read -r filename url; do
@@ -164,22 +202,29 @@ jobs:
           curl -fsSL "$(cat checksums-url)" -o SHA256SUMS
 
           python3 - <<'PY'
-          import hashlib, os, re, sys
+          import hashlib
+          import os
+          import re
+          import sys
 
-          work = os.getcwd()
           assets = []
 
           with open("assets.tsv", encoding="utf-8") as f:
               for line in f:
-                  filename = line.rstrip("\n").split("\t", 1)[0]
-                  assets.append(filename)
+                  assets.append(line.rstrip("\n").split("\t", 1)[0])
 
           sums = {}
+
           with open("SHA256SUMS", encoding="utf-8") as f:
               for line in f:
-                  m = re.match(r"^([0-9a-fA-F]{64})\s+[* ]?(.+?)\s*$", line)
+                  m = re.match(
+                      r"^([0-9a-fA-F]{64})\s+[* ]?(.+?)\s*$",
+                      line
+                  )
                   if m:
-                      sums[m.group(2)] = m.group(1).lower()
+                      sums[os.path.basename(m.group(2))] = (
+                          m.group(1).lower()
+                      )
 
           for filename in assets:
               if filename not in sums:
@@ -203,6 +248,7 @@ jobs:
 
           WORK="$RUNNER_TEMP/package-work"
           ROOT="$WORK/pkgroot"
+
           mkdir -p "$ROOT/usr/bin" "$ROOT/etc/$PKGNAME"
 
           while IFS=$'\t' read -r filename url; do
@@ -211,7 +257,7 @@ jobs:
                 "$ROOT/usr/bin/$PKGNAME"
 
             elif [[ "$filename" == "$PKGNAME-"*"-linux-x86_64" ]]; then
-              output="${filename%"-linux-x86_64"}"
+              output="${filename%-linux-x86_64}"
               install -m 0755 "$WORK/$filename" \
                 "$ROOT/usr/bin/$output"
 
@@ -222,22 +268,23 @@ jobs:
             fi
           done < "$WORK/assets.tsv"
 
-          PKGFILE="$WORK/$PKGNAME.pkg.tar.zst"
+          PKGBUILDDATE="$(date +%s)"
           DESC="$(cat "$RUNNER_TEMP/package-desc")"
           INSTALL_SIZE="$(du -sb "$ROOT" | cut -f1)"
-          BUILDDATE="$(date +%s)"
 
           cat > "$ROOT/.PKGINFO" <<EOF
           pkgname = $PKGNAME
           pkgbase = $PKGNAME
           pkgver = $PKGVER-1
           pkgdesc = $DESC
-          builddate = $BUILDDATE
+          builddate = $PKGBUILDDATE
           packager = voidctx <packages@voidctx.dev>
           size = $INSTALL_SIZE
           arch = x86_64
           license = unknown
           EOF
+
+          PKGFILE="$WORK/$PKGNAME.pkg.tar.zst"
 
           tar --zstd -cf "$PKGFILE" \
             --sort=name \
@@ -245,23 +292,17 @@ jobs:
             -C "$ROOT" .
 
           echo "PKGFILE=$PKGFILE" >> "$GITHUB_ENV"
+          echo "PKGBUILDDATE=$PKGBUILDDATE" >> "$GITHUB_ENV"
 
-      - name: Sign package and configure GPG
+      - name: Sign package
         shell: bash
         run: |
           set -euo pipefail
-
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
-          mkdir -m 700 -p "$GNUPGHOME"
 
-          printf '%s' "$GPG_PRIVATE_KEY" |
-            gpg --batch --import
-
-          gpg --batch --list-secret-keys "$GPG_KEY_ID"
-
+          # The imported private key is unencrypted.
+          # GPG_PASSPHRASE was used only to decrypt privkey.asc.gpg.
           gpg --batch --yes \
-            --pinentry-mode loopback \
-            --passphrase "$GPG_PASSPHRASE" \
             --local-user "$GPG_KEY_ID" \
             --detach-sign \
             --output "$PKGFILE.sig" \
@@ -285,10 +326,12 @@ jobs:
           if aws --endpoint-url "$ENDPOINT" s3api head-object \
               --bucket "$R2_BUCKET" --key "$DBKEY" >/dev/null 2>&1; then
             aws --endpoint-url "$ENDPOINT" s3 cp \
-              "s3://$R2_BUCKET/$DBKEY" "$WORK/repo/voidctx.db.tar.gz"
+              "s3://$R2_BUCKET/$DBKEY" \
+              "$WORK/repo/voidctx.db.tar.gz"
           else
             python3 - "$WORK/repo/voidctx.db.tar.gz" <<'PY'
-          import sys, tarfile
+          import sys
+          import tarfile
 
           with tarfile.open(sys.argv[1], "w:gz"):
               pass
@@ -308,54 +351,75 @@ jobs:
           cp "$PKGFILE.sig" "$REPO/$PKGNAME.pkg.tar.zst.sig"
 
           python3 - <<'PY'
-          import hashlib, io, os, tarfile, time
+          import hashlib
+          import io
+          import os
+          import subprocess
+          import tarfile
+          import time
 
           work = os.environ["RUNNER_TEMP"] + "/package-work"
           repo = work + "/repo"
           name = os.environ["PKGNAME"]
           version = os.environ["PKGVER"] + "-1"
-          desc = open(os.environ["RUNNER_TEMP"] + "/package-desc").read().strip()
+          desc = open(
+              os.environ["RUNNER_TEMP"] + "/package-desc",
+              encoding="utf-8"
+          ).read().strip()
 
           pkg_path = repo + "/" + name + ".pkg.tar.zst"
           db_path = repo + "/voidctx.db.tar.gz"
 
+          digest = hashlib.sha256()
+          compressed_size = 0
+
           with open(pkg_path, "rb") as f:
-              pkg_bytes = f.read()
+              for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                  digest.update(chunk)
+                  compressed_size += len(chunk)
 
-          checksum = hashlib.sha256(pkg_bytes).hexdigest()
-          compressed_size = len(pkg_bytes)
-          builddate = int(time.time())
+          checksum = digest.hexdigest()
 
-          # Compute installed size and installed paths from the package.
-          import subprocess
-          listing = subprocess.check_output(
-              ["tar", "--zstd", "-tf", pkg_path], text=True
-          ).splitlines()
+          # Read package entries without extracting arbitrary paths.
+          proc = subprocess.Popen(
+              ["zstd", "-dc", pkg_path],
+              stdout=subprocess.PIPE
+          )
 
           paths = []
           installed_size = 0
-          for entry in listing:
-              path = entry.removeprefix("./").rstrip("/")
-              if not path or path in (".", ".PKGINFO", ".MTREE"):
-                  continue
-              if path.startswith("/") or ".." in path.split("/"):
-                  raise SystemExit(f"Unsafe package path: {path}")
-              paths.append(path)
 
-          # Extract regular-file sizes from the archive.
-          # GNU tar's listing is used for paths; file sizes are read via tar.
-          with tarfile.open(fileobj=io.BytesIO(
-              subprocess.check_output(["zstd", "-dc", pkg_path])
-          ), mode="r:") as package:
-              for member in package.getmembers():
-                  path = member.name.removeprefix("./").rstrip("/")
-                  if member.isfile() and path not in (".PKGINFO", ".MTREE"):
-                      installed_size += member.size
+          try:
+              with tarfile.open(fileobj=proc.stdout, mode="r|") as package:
+                  for member in package:
+                      path = member.name
+                      if path.startswith("./"):
+                          path = path[2:]
+                      path = path.rstrip("/")
+
+                      if not path or path == ".PKGINFO":
+                          continue
+
+                      if path.startswith("/") or ".." in path.split("/"):
+                          raise SystemExit(f"Unsafe package path: {path}")
+
+                      paths.append(path)
+
+                      if member.isfile() and path != ".MTREE":
+                          installed_size += member.size
+          finally:
+              if proc.stdout:
+                  proc.stdout.close()
+
+          if proc.wait() != 0:
+              raise SystemExit("Failed to decompress package archive")
 
           if not paths:
-              raise SystemExit("Package has no installed files")
+              raise SystemExit("Package contains no installable files")
 
+          builddate = int(os.environ["PKGBUILDDATE"])
           package_dir = f"{name}-{version}"
+
           desc_text = (
               f"%FILENAME%\n{name}.pkg.tar.zst\n\n"
               f"%NAME%\n{name}\n\n"
@@ -372,29 +436,35 @@ jobs:
               f"%VALIDATION%\npgp\n"
           ).encode()
 
-          files_text = ("%FILES%\n" + "\n".join(sorted(paths)) + "\n").encode()
+          files_text = (
+              "%FILES%\n" + "\n".join(sorted(set(paths))) + "\n"
+          ).encode()
 
-          # Preserve all other packages, replacing this package's old entry.
-          preserved = []
+          # Identify all existing database directories for this package.
+          old_members = []
+          target_dirs = set()
+
           with tarfile.open(db_path, "r:gz") as old:
               for member in old.getmembers():
                   if not member.isfile():
                       continue
 
-                  root = member.name.split("/", 1)[0]
-                  if not member.name.endswith("/desc"):
-                      preserved.append((member, old.extractfile(member).read()))
-                      continue
+                  data = old.extractfile(member).read()
 
-                  content = old.extractfile(member).read().decode(errors="replace")
-                  is_target = f"%NAME%\n{name}\n" in content
-                  if is_target:
-                      continue
+                  if member.name.endswith("/desc"):
+                      text = data.decode(errors="replace")
+                      if f"%NAME%\n{name}\n" in text:
+                          target_dirs.add(member.name.rsplit("/", 1)[0])
 
-                  preserved.append((member, content.encode()))
+                  old_members.append((member, data))
 
+          # Replace the target package entry; preserve every other package.
           with tarfile.open(db_path, "w:gz") as new:
-              for member, data in preserved:
+              for member, data in old_members:
+                  parent = member.name.rsplit("/", 1)[0]
+                  if parent in target_dirs:
+                      continue
+
                   info = tarfile.TarInfo(member.name)
                   info.size = len(data)
                   info.mode = member.mode
@@ -413,9 +483,10 @@ jobs:
                   info.type = tarfile.REGTYPE
                   new.addfile(info, io.BytesIO(data))
 
-          # The .db file is a copy of the database archive, not a symlink.
+          # Pacman supports both database filenames.
           with open(db_path, "rb") as src:
               data = src.read()
+
           with open(repo + "/voidctx.db", "wb") as dst:
               dst.write(data)
           PY
@@ -424,14 +495,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
+
           REPO="$RUNNER_TEMP/package-work/repo"
 
+          # Use the same imported, unencrypted private key as package signing.
           for file in "$REPO/voidctx.db.tar.gz" "$REPO/voidctx.db"; do
             gpg --batch --yes \
-              --pinentry-mode loopback \
-              --passphrase "$GPG_PASSPHRASE" \
               --local-user "$GPG_KEY_ID" \
               --detach-sign \
               --output "$file.sig" \
@@ -460,6 +530,7 @@ jobs:
               --content-type "$type"
           }
 
+          # Publish the package before making the new database visible.
           upload "$REPO/$PKGNAME.pkg.tar.zst" \
             "x86_64/$PKGNAME.pkg.tar.zst" \
             "application/zstd"
@@ -484,4 +555,4 @@ jobs:
             "x86_64/voidctx.db.sig" \
             "application/pgp-signature"
 
-          echo "Published $PKGNAME $PKGVER to R2"
+          echo "Published $PKGNAME $PKGVER"

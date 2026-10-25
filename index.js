@@ -2,81 +2,74 @@
 
 const list = document.querySelector("#package-list");
 const count = document.querySelector("#package-count");
-const updated = document.querySelector("#updated");
 const error = document.querySelector("#error");
 
-function cell(text) {
-  const td = document.createElement("td");
-  td.textContent = text;
-  return td;
-}
-
-function linkCell(text, href) {
-  const td = document.createElement("td");
-  const a = document.createElement("a");
-  a.textContent = text;
-  a.href = href;
-  a.rel = "noopener noreferrer";
-  td.append(a);
-  return td;
-}
-
-async function loadIndex() {
+async function loadCatalog() {
   try {
-    const response = await fetch("/metadata/index.json", {
+    const response = await fetch("./meta.json", {
       cache: "no-store"
     });
 
     if (!response.ok) {
-      throw new Error(`Index request failed: HTTP ${response.status}`);
+      throw new Error(`Catalog request failed: HTTP ${response.status}`);
     }
 
-    const index = await response.json();
+    const packages = await response.json();
 
-    if (!Array.isArray(index.packages)) {
-      throw new Error("Invalid package index");
+    if (!Array.isArray(packages)) {
+      throw new Error("Invalid catalog format");
     }
 
     list.replaceChildren();
-    count.textContent = `${index.packages.length} package(s)`;
+    count.textContent = `${packages.length} package(s)`;
 
-    updated.textContent = index.updated_at
-      ? `Last updated: ${new Date(index.updated_at).toLocaleString()}`
-      : "Not yet published";
+    for (const pkg of packages) {
+      const row = document.createElement("tr");
 
-    for (const pkg of index.packages) {
-      const tr = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = pkg.name;
 
-      tr.append(
-        cell(pkg.name),
-        cell(pkg.version),
-        cell(index.architecture || "x86_64"),
-        linkCell("Source ↗", pkg.url)
-      );
+      const asset = document.createElement("td");
+      asset.textContent = pkg.asset;
 
-      list.append(tr);
+      const source = document.createElement("td");
+      const link = document.createElement("a");
+      link.href = pkg.url;
+      link.textContent = "GitHub ↗";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      source.append(link);
+
+      row.append(name, asset, source);
+      list.append(row);
     }
 
-    if (index.packages.length === 0) {
-      list.append(cell("No packages published yet."));
+    if (packages.length === 0) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 3;
+      cell.textContent = "No packages configured.";
+      row.append(cell);
+      list.append(row);
     }
   } catch (err) {
     count.textContent = "Unavailable";
+    list.replaceChildren();
     error.hidden = false;
     error.textContent = err.message;
-    list.replaceChildren();
   }
 }
 
 document.querySelector("#copy-config").addEventListener("click", async () => {
   const config = "[voidctx]\nServer = https://repo.voidctx.dev/$arch";
+  const button = document.querySelector("#copy-config");
 
   try {
     await navigator.clipboard.writeText(config);
-    document.querySelector("#copy-config").textContent = "Copied";
+    button.textContent = "Copied";
   } catch {
-    document.querySelector("#copy-config").textContent = "Copy unavailable";
+    button.textContent = "Copy unavailable";
   }
 });
 
-loadIndex();
+loadCatalog();

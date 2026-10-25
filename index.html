@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101318">
   <title>voidctx - Pacman Repository</title>
-  <link rel="stylesheet" href="/style.css">
-  <script src="/index.js" defer></script>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./index.js" defer></script>
 </head>
 <body>
   <header class="container">
-    <a class="brand" href="/">voidctx<span>.</span></a>
-    <span class="status"><i></i> Repository status</span>
+    <a class="brand" href="./">voidctx<span>.</span></a>
+    <span class="status"><i></i> Repository catalog</span>
   </header>
 
   <main class="container">
@@ -19,15 +19,17 @@
       <p class="eyebrow">ARCH LINUX · X86_64</p>
       <h1>Software, <span>without the bloat.</span></h1>
       <p class="muted">
-        Custom software distributed through the voidctx Pacman repository.
+        Personal software releases distributed through the voidctx
+        Pacman repository.
       </p>
+
       <div class="install">
         <code>[voidctx]</code>
         <code>Server = https://repo.voidctx.dev/$arch</code>
         <button id="copy-config" type="button">Copy config</button>
       </div>
       <p class="muted small">
-        Add the repository configuration to /etc/pacman.conf.
+        Add this repository to /etc/pacman.conf.
       </p>
     </section>
 
@@ -40,20 +42,17 @@
         <span id="package-count" class="count">Loading…</span>
       </div>
 
-      <p id="updated" class="muted small"></p>
-
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th>Package</th>
-              <th>Version</th>
-              <th>Architecture</th>
+              <th>Release asset</th>
               <th>Source</th>
             </tr>
           </thead>
           <tbody id="package-list">
-            <tr><td colspan="4">Loading package index…</td></tr>
+            <tr><td colspan="3">Loading catalog…</td></tr>
           </tbody>
         </table>
       </div>
@@ -63,8 +62,8 @@
 
     <footer>
       <span>voidctx · Personal package repository</span>
-      <a href="/metadata/index.json">JSON index</a>
-      <a href="/voidctx.gpg">Signing key</a>
+      <a href="./meta.json">JSON catalog</a>
+      <a href="./voidctx.gpg">Signing key</a>
     </footer>
   </main>
 </body>
