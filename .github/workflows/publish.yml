@@ -1,245 +1,487 @@
-name: Publish package
+name: Publish Pacman Package
 
 on:
   repository_dispatch:
     types: [publish-pacman-package]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: voidctx-package-publication
+  group: voidctx-r2-publish
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    env:
+      SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+      RELEASE_TAG: ${{ github.event.client_payload.tag }}
+      PKGNAME: ${{ github.event.client_payload.name }}
+
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+      GPG_KEY_ID: ${{ vars.PACMAN_GPG_KEY_ID }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate release and catalog entry
-        id: meta
-        env:
-          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
-          TAG: ${{ github.event.client_payload.tag }}
+      - name: Validate request and load description
         shell: bash
         run: |
           set -euo pipefail
 
-          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.0$ ]]
-
-          matches="$(jq -c \
-            --arg repo "$SOURCE_REPO" \
-            '[.[] | select(
-              (.url | sub("^https://github.com/"; "") | sub("/$"; ""))
-              == $repo
-            )]' metadata/packages.json)"
-
-          [[ "$(jq 'length' <<< "$matches")" == 1 ]] || {
-            echo "No unique package mapping for $SOURCE_REPO" >&2
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo "Invalid source repository"
             exit 1
           }
 
-          entry="$(jq -c '.[0]' <<< "$matches")"
-          name="$(jq -r '.name' <<< "$entry")"
-          asset="$(jq -r '.asset' <<< "$entry")"
-          url="$(jq -r '.url' <<< "$entry")"
-
-          [[ "$name" =~ ^[a-z0-9][a-z0-9@._+-]*$ ]]
-          [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ ]]
-
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download and verify release binary
-        id: binary
-        env:
-          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
-          TAG: ${{ github.event.client_payload.tag }}
-          ASSET: ${{ steps.meta.outputs.asset }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          dir="$RUNNER_TEMP/release"
-          mkdir -p "$dir"
-
-          base="https://github.com/${SOURCE_REPO}/releases/download/${TAG}"
-
-          curl --fail --location --retry 3 \
-            "$base/SHA256SUMS" -o "$dir/SHA256SUMS"
-
-          curl --fail --location --retry 3 \
-            "$base/$ASSET" -o "$dir/$ASSET"
-
-          expected="$(awk -v f="$ASSET" '$2 == f {print $1}' \
-            "$dir/SHA256SUMS")"
-
-          [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || {
-            echo "Missing or invalid SHA256SUMS entry" >&2
+          [[ "$PKGNAME" =~ ^[a-z0-9][a-z0-9@._+-]*$ ]] || {
+            echo "Invalid package name"
             exit 1
           }
 
-          printf '%s  %s\n' "$expected" "$ASSET" \
-            | (cd "$dir" && sha256sum --check -)
-
-          echo "binary_sha256=$expected" >> "$GITHUB_OUTPUT"
-
-      - name: Build Arch package from static binary
-        id: package
-        env:
-          PKGNAME: ${{ steps.meta.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          ASSET: ${{ steps.meta.outputs.asset }}
-          URL: ${{ steps.meta.outputs.url }}
-          BINARY_SHA256: ${{ steps.binary.outputs.binary_sha256 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          work="$RUNNER_TEMP/pkgwork"
-          out="$RUNNER_TEMP/pkgout"
-
-          mkdir -p "$work" "$out"
-          cp "$RUNNER_TEMP/release/$ASSET" "$work/$ASSET"
-
-          cat > "$work/PKGBUILD" <<PKGBUILD
-          pkgname=$PKGNAME
-          pkgver=$VERSION
-          pkgrel=1
-          pkgdesc="$PKGNAME static-musl binary"
-          arch=('x86_64')
-          url='$URL'
-          depends=()
-          options=('!strip')
-          source=("file:///work/$ASSET")
-          sha256sums=('$BINARY_SHA256')
-
-          package() {
-            install -Dm755 "\$srcdir/$ASSET" \
-              "\$pkgdir/usr/bin/$PKGNAME"
-          }
-          PKGBUILD
-
-          docker run --rm \
-            -v "$work:/work" \
-            -w /work \
-            archlinux:latest \
-            bash -euc '
-              pacman -Syu --noconfirm
-              pacman -S --needed --noconfirm base-devel
-              useradd -m builder
-              chown -R builder:builder /work
-              runuser -u builder -- \
-                makepkg --syncdeps --noconfirm --cleanbuild
-            '
-
-          mapfile -t built < <(
-            find "$work" -maxdepth 1 -type f \
-              -name "${PKGNAME}-*.pkg.tar.zst"
-          )
-
-          ((${#built[@]} == 1)) || {
-            echo "Expected exactly one built package" >&2
+          [[ "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.0)$ ]] || {
+            echo "Only stable vX.Y.0 releases are accepted"
             exit 1
           }
 
-          # R2 uses a stable filename; the package's internal
-          # metadata still contains the real version.
-          mv "${built[0]}" "$out/$PKGNAME.pkg.tar.zst"
+          echo "PKGVER=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
 
-          sha="$(sha256sum "$out/$PKGNAME.pkg.tar.zst" | awk '{print $1}')"
-          echo "package_sha256=$sha" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json, os, sys
 
-      - name: Sign package
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
-          GPG_KEY_ID: ${{ vars.PACMAN_GPG_KEY_ID }}
-          PKGNAME: ${{ steps.meta.outputs.name }}
+          name = os.environ["PKGNAME"]
+
+          with open("meta.json", encoding="utf-8") as f:
+              catalog = json.load(f)
+
+          matches = [p for p in catalog if p.get("name") == name]
+          if len(matches) != 1:
+              sys.exit(f"Expected exactly one meta.json entry for {name}")
+
+          desc = matches[0].get("desc", "").strip()
+          if not desc or "\n" in desc or "\r" in desc:
+              sys.exit(f"Invalid or missing description for {name}")
+
+          with open(os.environ["RUNNER_TEMP"] + "/package-desc", "w") as f:
+              f.write(desc)
+          PY
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl zstd gnupg awscli python3
+
+      - name: Discover and download release assets
         shell: bash
         run: |
           set -euo pipefail
 
-          [[ -n "$GPG_PRIVATE_KEY" ]]
-          [[ -n "$GPG_PASSPHRASE" ]]
-          [[ -n "$GPG_KEY_ID" ]]
+          WORK="$RUNNER_TEMP/package-work"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          API="https://api.github.com/repos/$SOURCE_REPO/releases/tags/$RELEASE_TAG"
+
+          curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            "$API" \
+            -o release.json
+
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          name = os.environ["PKGNAME"]
+
+          with open("release.json", encoding="utf-8") as f:
+              release = json.load(f)
+
+          assets = release.get("assets", [])
+          binaries = []
+          configs = []
+
+          for asset in assets:
+              filename = asset["name"]
+
+              if (
+                  filename == f"{name}-linux-x86_64"
+                  or (
+                      filename.startswith(name + "-")
+                      and filename.endswith("-linux-x86_64")
+                      and len(filename) > len(name + "-linux-x86_64")
+                  )
+              ):
+                  binaries.append(asset)
+
+              elif (
+                  filename.startswith(name + ".")
+                  and filename.endswith(".default")
+                  and len(filename) > len(name + ".default")
+              ):
+                  configs.append(asset)
+
+          if len(binaries) != 1:
+              sys.exit(
+                  f"Expected exactly one matching Linux x86_64 executable; "
+                  f"found {[a['name'] for a in binaries]}"
+              )
+
+          selected = binaries + configs
+
+          if len({a["name"] for a in selected}) != len(selected):
+              sys.exit("Duplicate release asset names")
+
+          checksum_assets = [
+              a for a in assets if a["name"] == "SHA256SUMS"
+          ]
+          if len(checksum_assets) != 1:
+              sys.exit("Release must contain exactly one SHA256SUMS asset")
+
+          with open("assets.tsv", "w", encoding="utf-8") as f:
+              for asset in selected:
+                  print(
+                      asset["name"] + "\t" + asset["browser_download_url"],
+                      file=f
+                  )
+
+          with open("checksums-url", "w", encoding="utf-8") as f:
+              f.write(checksum_assets[0]["browser_download_url"])
+          PY
+
+          while IFS=$'\t' read -r filename url; do
+            echo "Downloading $filename"
+            curl -fsSL "$url" -o "$filename"
+          done < assets.tsv
+
+          curl -fsSL "$(cat checksums-url)" -o SHA256SUMS
+
+          python3 - <<'PY'
+          import hashlib, os, re, sys
+
+          work = os.getcwd()
+          assets = []
+
+          with open("assets.tsv", encoding="utf-8") as f:
+              for line in f:
+                  filename = line.rstrip("\n").split("\t", 1)[0]
+                  assets.append(filename)
+
+          sums = {}
+          with open("SHA256SUMS", encoding="utf-8") as f:
+              for line in f:
+                  m = re.match(r"^([0-9a-fA-F]{64})\s+[* ]?(.+?)\s*$", line)
+                  if m:
+                      sums[m.group(2)] = m.group(1).lower()
+
+          for filename in assets:
+              if filename not in sums:
+                  sys.exit(f"{filename} is missing from SHA256SUMS")
+
+              h = hashlib.sha256()
+              with open(filename, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+
+              if h.hexdigest() != sums[filename]:
+                  sys.exit(f"SHA256 mismatch: {filename}")
+
+              print(f"Verified {filename}")
+          PY
+
+      - name: Build package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/package-work"
+          ROOT="$WORK/pkgroot"
+          mkdir -p "$ROOT/usr/bin" "$ROOT/etc/$PKGNAME"
+
+          while IFS=$'\t' read -r filename url; do
+            if [[ "$filename" == "$PKGNAME-linux-x86_64" ]]; then
+              install -m 0755 "$WORK/$filename" \
+                "$ROOT/usr/bin/$PKGNAME"
+
+            elif [[ "$filename" == "$PKGNAME-"*"-linux-x86_64" ]]; then
+              output="${filename%"-linux-x86_64"}"
+              install -m 0755 "$WORK/$filename" \
+                "$ROOT/usr/bin/$output"
+
+            elif [[ "$filename" == "$PKGNAME."*".default" ]]; then
+              output="${filename%.default}"
+              install -m 0644 "$WORK/$filename" \
+                "$ROOT/etc/$PKGNAME/$output"
+            fi
+          done < "$WORK/assets.tsv"
+
+          PKGFILE="$WORK/$PKGNAME.pkg.tar.zst"
+          DESC="$(cat "$RUNNER_TEMP/package-desc")"
+          INSTALL_SIZE="$(du -sb "$ROOT" | cut -f1)"
+          BUILDDATE="$(date +%s)"
+
+          cat > "$ROOT/.PKGINFO" <<EOF
+          pkgname = $PKGNAME
+          pkgbase = $PKGNAME
+          pkgver = $PKGVER-1
+          pkgdesc = $DESC
+          builddate = $BUILDDATE
+          packager = voidctx <packages@voidctx.dev>
+          size = $INSTALL_SIZE
+          arch = x86_64
+          license = unknown
+          EOF
+
+          tar --zstd -cf "$PKGFILE" \
+            --sort=name \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$ROOT" .
+
+          echo "PKGFILE=$PKGFILE" >> "$GITHUB_ENV"
+
+      - name: Sign package and configure GPG
+        shell: bash
+        run: |
+          set -euo pipefail
 
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
-          install -d -m 700 "$GNUPGHOME"
+          mkdir -m 700 -p "$GNUPGHOME"
 
-          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s' "$GPG_PRIVATE_KEY" |
+            gpg --batch --import
 
-          gpg --batch --yes --pinentry-mode loopback \
+          gpg --batch --list-secret-keys "$GPG_KEY_ID"
+
+          gpg --batch --yes \
+            --pinentry-mode loopback \
             --passphrase "$GPG_PASSPHRASE" \
             --local-user "$GPG_KEY_ID" \
             --detach-sign \
-            --output "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst.sig" \
-            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst"
+            --output "$PKGFILE.sig" \
+            "$PKGFILE"
 
-      - name: Upload temporary package artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pacman-package
-          path: ${{ runner.temp }}/pkgout/
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload current package to R2
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          PKGNAME: ${{ steps.meta.outputs.name }}
+      - name: Download current repository database
         shell: bash
         run: |
           set -euo pipefail
 
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION=auto
 
-          for file in \
-            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst" \
-            "$RUNNER_TEMP/pkgout/$PKGNAME.pkg.tar.zst.sig"; do
+          ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          WORK="$RUNNER_TEMP/package-work"
+          mkdir -p "$WORK/repo"
 
-            docker run --rm \
-              -v "$RUNNER_TEMP/pkgout:/out:ro" \
-              -e AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
-              -e AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
-              -e AWS_DEFAULT_REGION=auto \
-              amazon/aws-cli:2 \
-              s3 cp "/out/$(basename "$file")" \
-              "s3://${R2_BUCKET}/x86_64/$(basename "$file")" \
-              --endpoint-url "$endpoint" \
-              --only-show-errors
+          DBKEY="x86_64/voidctx.db.tar.gz"
+
+          if aws --endpoint-url "$ENDPOINT" s3api head-object \
+              --bucket "$R2_BUCKET" --key "$DBKEY" >/dev/null 2>&1; then
+            aws --endpoint-url "$ENDPOINT" s3 cp \
+              "s3://$R2_BUCKET/$DBKEY" "$WORK/repo/voidctx.db.tar.gz"
+          else
+            python3 - "$WORK/repo/voidctx.db.tar.gz" <<'PY'
+          import sys, tarfile
+
+          with tarfile.open(sys.argv[1], "w:gz"):
+              pass
+          PY
+          fi
+
+      - name: Update repository database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/package-work"
+          REPO="$WORK/repo"
+          PKGFILE="$WORK/$PKGNAME.pkg.tar.zst"
+
+          cp "$PKGFILE" "$REPO/$PKGNAME.pkg.tar.zst"
+          cp "$PKGFILE.sig" "$REPO/$PKGNAME.pkg.tar.zst.sig"
+
+          python3 - <<'PY'
+          import hashlib, io, os, tarfile, time
+
+          work = os.environ["RUNNER_TEMP"] + "/package-work"
+          repo = work + "/repo"
+          name = os.environ["PKGNAME"]
+          version = os.environ["PKGVER"] + "-1"
+          desc = open(os.environ["RUNNER_TEMP"] + "/package-desc").read().strip()
+
+          pkg_path = repo + "/" + name + ".pkg.tar.zst"
+          db_path = repo + "/voidctx.db.tar.gz"
+
+          with open(pkg_path, "rb") as f:
+              pkg_bytes = f.read()
+
+          checksum = hashlib.sha256(pkg_bytes).hexdigest()
+          compressed_size = len(pkg_bytes)
+          builddate = int(time.time())
+
+          # Compute installed size and installed paths from the package.
+          import subprocess
+          listing = subprocess.check_output(
+              ["tar", "--zstd", "-tf", pkg_path], text=True
+          ).splitlines()
+
+          paths = []
+          installed_size = 0
+          for entry in listing:
+              path = entry.removeprefix("./").rstrip("/")
+              if not path or path in (".", ".PKGINFO", ".MTREE"):
+                  continue
+              if path.startswith("/") or ".." in path.split("/"):
+                  raise SystemExit(f"Unsafe package path: {path}")
+              paths.append(path)
+
+          # Extract regular-file sizes from the archive.
+          # GNU tar's listing is used for paths; file sizes are read via tar.
+          with tarfile.open(fileobj=io.BytesIO(
+              subprocess.check_output(["zstd", "-dc", pkg_path])
+          ), mode="r:") as package:
+              for member in package.getmembers():
+                  path = member.name.removeprefix("./").rstrip("/")
+                  if member.isfile() and path not in (".PKGINFO", ".MTREE"):
+                      installed_size += member.size
+
+          if not paths:
+              raise SystemExit("Package has no installed files")
+
+          package_dir = f"{name}-{version}"
+          desc_text = (
+              f"%FILENAME%\n{name}.pkg.tar.zst\n\n"
+              f"%NAME%\n{name}\n\n"
+              f"%BASE%\n{name}\n\n"
+              f"%VERSION%\n{version}\n\n"
+              f"%DESC%\n{desc}\n\n"
+              f"%CSIZE%\n{compressed_size}\n\n"
+              f"%ISIZE%\n{installed_size}\n\n"
+              f"%SHA256SUM%\n{checksum}\n\n"
+              f"%ARCH%\nx86_64\n\n"
+              f"%BUILDDATE%\n{builddate}\n\n"
+              f"%PACKAGER%\nvoidctx <packages@voidctx.dev>\n\n"
+              f"%LICENSE%\nunknown\n\n"
+              f"%VALIDATION%\npgp\n"
+          ).encode()
+
+          files_text = ("%FILES%\n" + "\n".join(sorted(paths)) + "\n").encode()
+
+          # Preserve all other packages, replacing this package's old entry.
+          preserved = []
+          with tarfile.open(db_path, "r:gz") as old:
+              for member in old.getmembers():
+                  if not member.isfile():
+                      continue
+
+                  root = member.name.split("/", 1)[0]
+                  if not member.name.endswith("/desc"):
+                      preserved.append((member, old.extractfile(member).read()))
+                      continue
+
+                  content = old.extractfile(member).read().decode(errors="replace")
+                  is_target = f"%NAME%\n{name}\n" in content
+                  if is_target:
+                      continue
+
+                  preserved.append((member, content.encode()))
+
+          with tarfile.open(db_path, "w:gz") as new:
+              for member, data in preserved:
+                  info = tarfile.TarInfo(member.name)
+                  info.size = len(data)
+                  info.mode = member.mode
+                  info.mtime = member.mtime
+                  info.type = tarfile.REGTYPE
+                  new.addfile(info, io.BytesIO(data))
+
+              for filename, data in (
+                  (package_dir + "/desc", desc_text),
+                  (package_dir + "/files", files_text),
+              ):
+                  info = tarfile.TarInfo(filename)
+                  info.size = len(data)
+                  info.mode = 0o644
+                  info.mtime = builddate
+                  info.type = tarfile.REGTYPE
+                  new.addfile(info, io.BytesIO(data))
+
+          # The .db file is a copy of the database archive, not a symlink.
+          with open(db_path, "rb") as src:
+              data = src.read()
+          with open(repo + "/voidctx.db", "wb") as dst:
+              dst.write(data)
+          PY
+
+      - name: Sign database files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          REPO="$RUNNER_TEMP/package-work/repo"
+
+          for file in "$REPO/voidctx.db.tar.gz" "$REPO/voidctx.db"; do
+            gpg --batch --yes \
+              --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$GPG_KEY_ID" \
+              --detach-sign \
+              --output "$file.sig" \
+              "$file"
           done
 
-      - name: Trigger database update workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PKGNAME: ${{ steps.meta.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          URL: ${{ steps.meta.outputs.url }}
-          ASSET: ${{ steps.meta.outputs.asset }}
-          PACKAGE_SHA256: ${{ steps.package.outputs.package_sha256 }}
-          TAG: ${{ github.event.client_payload.tag }}
+      - name: Publish package and database to R2
         shell: bash
         run: |
           set -euo pipefail
 
-          gh api --method POST \
-            repos/voidctx/repo/dispatches \
-            -f event_type='update-pacman-db' \
-            -f client_payload[name]="$PKGNAME" \
-            -f client_payload[version]="$VERSION" \
-            -f client_payload[url]="$URL" \
-            -f client_payload[asset]="$ASSET" \
-            -f client_payload[tag]="$TAG" \
-            -f client_payload[sha256]="$PACKAGE_SHA256" \
-            -F client_payload[run_id]="$GITHUB_RUN_ID"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION=auto
+
+          ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          REPO="$RUNNER_TEMP/package-work/repo"
+
+          upload() {
+            local file="$1"
+            local key="$2"
+            local type="$3"
+
+            aws --endpoint-url "$ENDPOINT" s3 cp \
+              "$file" "s3://$R2_BUCKET/$key" \
+              --content-type "$type"
+          }
+
+          upload "$REPO/$PKGNAME.pkg.tar.zst" \
+            "x86_64/$PKGNAME.pkg.tar.zst" \
+            "application/zstd"
+
+          upload "$REPO/$PKGNAME.pkg.tar.zst.sig" \
+            "x86_64/$PKGNAME.pkg.tar.zst.sig" \
+            "application/pgp-signature"
+
+          upload "$REPO/voidctx.db.tar.gz" \
+            "x86_64/voidctx.db.tar.gz" \
+            "application/gzip"
+
+          upload "$REPO/voidctx.db.tar.gz.sig" \
+            "x86_64/voidctx.db.tar.gz.sig" \
+            "application/pgp-signature"
+
+          upload "$REPO/voidctx.db" \
+            "x86_64/voidctx.db" \
+            "application/gzip"
+
+          upload "$REPO/voidctx.db.sig" \
+            "x86_64/voidctx.db.sig" \
+            "application/pgp-signature"
+
+          echo "Published $PKGNAME $PKGVER to R2"

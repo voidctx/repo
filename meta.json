@@ -1,7 +1,7 @@
 [
   {
     "name": "arkcode",
-    "asset": "arkcode-linux-x86_64",
+    "desc": "Lightweight Rust-based web IDE",
     "url": "https://github.com/voidctx/arkcode"
   }
 ]
