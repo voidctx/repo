@@ -440,8 +440,7 @@ jobs:
               f"%ARCH%\nx86_64\n\n"
               f"%BUILDDATE%\n{builddate}\n\n"
               f"%PACKAGER%\nvoidctx <packages@voidctx.dev>\n\n"
-              f"%LICENSE%\nunknown\n\n"
-              f"%VALIDATION%\npgp\n"
+              f"%LICENSE%\nunknown\n"
           ).encode()
 
           files_text = (
