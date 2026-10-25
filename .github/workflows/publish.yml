@@ -502,6 +502,53 @@ jobs:
               dst.write(data)
           PY
 
+      - name: Verify package checksum in database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="$RUNNER_TEMP/package-work/repo"
+          EXPECTED="$(sha256sum "$REPO/$PKGNAME.pkg.tar.zst" | awk '{print $1}')"
+
+          ACTUAL="$(
+            python3 - "$REPO/voidctx.db.tar.gz" "$PKGNAME" <<'PY'
+          import sys
+          import tarfile
+
+          db_path, wanted = sys.argv[1:]
+
+          with tarfile.open(db_path, "r:gz") as db:
+              for member in db.getmembers():
+                  if not member.isfile() or not member.name.endswith("/desc"):
+                      continue
+
+                  content = db.extractfile(member).read().decode()
+                  fields = content.splitlines()
+                  name = checksum = None
+
+                  for i, field in enumerate(fields[:-1]):
+                      if field == "%NAME%":
+                          name = fields[i + 1]
+                      elif field == "%SHA256SUM%":
+                          checksum = fields[i + 1]
+
+                  if name == wanted:
+                      if not checksum:
+                          sys.exit("Missing SHA256SUM in package database entry")
+                      print(checksum)
+                      break
+              else:
+                  sys.exit(f"Package {wanted} not found in database")
+          PY
+          )"
+          echo "Local package SHA256: $EXPECTED"
+          echo "Database entry SHA256: $ACTUAL"
+          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            echo "::error::Local package checksum does not match database entry"
+            exit 1
+          fi
+          echo "Checksum verification passed."
+
       - name: Sign database files
         shell: bash
         run: |
